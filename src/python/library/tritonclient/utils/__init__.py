@@ -1,4 +1,6 @@
-# Copyright 2020-2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#!/usr/bin/env python3
+
+# Copyright 2020-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -24,8 +26,25 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-import numpy as np
 import struct
+
+import ml_dtypes
+import numpy as np
+
+# Reserved request parameters for Triton's usage.
+# Other locations:
+# - server/src/common.h
+# - server/docs/protocol/extension_parameters.md
+TRITON_RESERVED_REQUEST_PARAMS = [
+    "sequence_id",
+    "sequence_start",
+    "sequence_end",
+    "priority",
+    "timeout",
+    "headers",
+    "binary_data_output",
+]
+TRITON_RESERVED_REQUEST_PARAMS_PREFIX = "triton_"
 
 
 def raise_error(msg):
@@ -51,12 +70,12 @@ def serialized_byte_size(tensor_value):
     """
 
     if tensor_value.dtype != np.object_:
-        raise_error('The tensor_value dtype must be np.object_')
+        raise_error("The tensor_value dtype must be np.object_")
 
     if tensor_value.size > 0:
         total_bytes = 0
         # 'C' order is row-major.
-        for obj in np.nditer(tensor_value, flags=["refs_ok"], order='C'):
+        for obj in np.nditer(tensor_value, flags=["refs_ok"], order="C"):
             total_bytes += len(obj.item())
         return total_bytes
     else:
@@ -87,7 +106,7 @@ class InferenceServerException(Exception):
     def __str__(self):
         msg = super().__str__() if self._msg is None else self._msg
         if self._status is not None:
-            msg = '[' + self._status + '] ' + msg
+            msg = "[" + self._status + "] " + msg
         return msg
 
     def message(self):
@@ -148,6 +167,10 @@ def np_to_triton_dtype(np_dtype):
         return "FP16"
     elif np_dtype == np.float32:
         return "FP32"
+    # DLIS-3986: numpy has no native BF16 dtype, so BF16 inputs must use
+    # ml_dtypes.bfloat16.
+    elif np_dtype == ml_dtypes.bfloat16:
+        return "BF16"
     elif np_dtype == np.float64:
         return "FP64"
     elif np_dtype == np.object_ or np_dtype.type == np.bytes_:
@@ -176,8 +199,12 @@ def triton_to_np_dtype(dtype):
         return np.uint64
     elif dtype == "FP16":
         return np.float16
-    elif dtype == "FP32" or dtype == "BF16":
+    elif dtype == "FP32":
         return np.float32
+    # DLIS-3986: numpy has no native BF16 dtype, so BF16 inputs must use
+    # ml_dtypes.bfloat16.
+    elif dtype == "BF16":
+        return ml_dtypes.bfloat16
     elif dtype == "FP64":
         return np.float64
     elif dtype == "BYTES":
@@ -188,7 +215,7 @@ def triton_to_np_dtype(dtype):
 def serialize_byte_tensor(input_tensor):
     """
     Serializes a bytes tensor into a flat numpy array of length prepended
-    bytes. The numpy array should use dtype of np.object_. For np.bytes_,
+    bytes. The numpy array should use dtype of np.object. For np.bytes,
     numpy will remove trailing zeros at the end of byte sequence and because
     of this it should be avoided.
 
@@ -216,13 +243,12 @@ def serialize_byte_tensor(input_tensor):
     # actual element bytes. All elements are concatenated together in row-major
     # order.
 
-    if (input_tensor.dtype != np.object_) and (input_tensor.dtype.type !=
-                                               np.bytes_):
+    if (input_tensor.dtype != np.object_) and (input_tensor.dtype.type != np.bytes_):
         raise_error("cannot serialize bytes tensor: invalid datatype")
 
     flattened_ls = []
     # 'C' order is row-major.
-    for obj in np.nditer(input_tensor, flags=["refs_ok"], order='C'):
+    for obj in np.nditer(input_tensor, flags=["refs_ok"], order="C"):
         # If directly passing bytes to BYTES type,
         # don't convert it to str as Python will encode the
         # bytes which may distort the meaning
@@ -230,16 +256,15 @@ def serialize_byte_tensor(input_tensor):
             if type(obj.item()) == bytes:
                 s = obj.item()
             else:
-                s = str(obj.item()).encode('utf-8')
+                s = str(obj.item()).encode("utf-8")
         else:
             s = obj.item()
         flattened_ls.append(struct.pack("<I", len(s)))
         flattened_ls.append(s)
-    flattened = b''.join(flattened_ls)
+    flattened = b"".join(flattened_ls)
     flattened_array = np.asarray(flattened, dtype=np.object_)
-    if not flattened_array.flags['C_CONTIGUOUS']:
-        flattened_array = np.ascontiguousarray(flattened_array,
-                                               dtype=np.object_)
+    if not flattened_array.flags["C_CONTIGUOUS"]:
+        flattened_array = np.ascontiguousarray(flattened_array, dtype=np.object_)
     return flattened_array
 
 
@@ -259,7 +284,7 @@ def deserialize_bytes_tensor(encoded_tensor):
     string_tensor : np.array
         The 1-D numpy array of type object containing the
         deserialized bytes in row-major form.
-   
+
     """
     strs = list()
     offset = 0
@@ -270,77 +295,4 @@ def deserialize_bytes_tensor(encoded_tensor):
         sb = struct.unpack_from("<{}s".format(l), val_buf, offset)[0]
         offset += l
         strs.append(sb)
-    return (np.array(strs, dtype=np.object_))
-
-
-def serialize_bf16_tensor(input_tensor):
-    """
-    Serializes a bfloat16 tensor into a flat numpy array of bytes.
-    The numpy array should use dtype of np.float32.
-
-    Parameters
-    ----------
-    input_tensor : np.array
-        The bfloat16 tensor to serialize.
-
-    Returns
-    -------
-    serialized_bf16_tensor : np.array
-        The 1-D numpy array of type uint8 containing the serialized bytes in row-major form.
-
-    Raises
-    ------
-    InferenceServerException
-        If unable to serialize the given tensor.
-    """
-
-    if input_tensor.size == 0:
-        return np.empty([0], dtype=np.object_)
-
-    # If the input is a tensor of float32, then must flatten those into
-    # a 1-dimensional array containing the element bytes. All elements
-    # are concatenated together in row-major order.
-
-    if (input_tensor.dtype != np.float32):
-        raise_error("cannot serialize bf16 tensor: invalid datatype")
-
-    flattened_ls = []
-    # 'C' order is row-major.
-    for obj in np.nditer(input_tensor, flags=["refs_ok"], order='C'):
-        # To trunctate the float32 to a bfloat16, we need the high-order bits.
-        obj_bytes = struct.pack("<f", obj)[2:4]
-        flattened_ls.append(obj_bytes)
-    flattened = b''.join(flattened_ls)
-    flattened_array = np.asarray(flattened, dtype=np.object_)
-    if not flattened_array.flags['C_CONTIGUOUS']:
-        flattened_array = np.ascontiguousarray(flattened_array,
-                                               dtype=np.object_)
-    return flattened_array
-
-
-def deserialize_bf16_tensor(encoded_tensor):
-    """
-    Deserializes an encoded bf16 tensor into a
-    numpy array of dtype of python objects
-
-    Parameters
-    ----------
-    encoded_tensor : bytes
-        The encoded bytes tensor where each element
-        is 2 bytes (size of bfloat16)
-    Returns
-    -------
-    string_tensor : np.array
-        The 1-D numpy array of type float32 containing the
-        deserialized bytes in row-major form.
-   
-    """
-    strs = list()
-    offset = 0
-    val_buf = encoded_tensor
-    while offset < len(val_buf):
-        sb = struct.unpack_from("<2s", val_buf, offset)[0]
-        # Bfloat16 contains 2 bytes
-        offset += 2
-        strs.append(struct.unpack('<f', (b'\x00\x00' + sb)))
-    return (np.array(strs, dtype=np.float32))
+    return np.array(strs, dtype=np.object_)

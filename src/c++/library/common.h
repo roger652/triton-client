@@ -1,4 +1,4 @@
-// Copyright 2020-2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// Copyright 2020-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -25,8 +25,6 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #pragma once
 
-/// \file
-
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -38,6 +36,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #ifdef TRITON_INFERENCE_SERVER_CLIENT_CLASS
@@ -66,7 +65,7 @@ class Error {
   explicit Error(const std::string& msg = "");
 
   /// Accessor for the message of this error.
-  /// \return The messsage for the error. Empty if no error.
+  /// \return The message for the error. Empty if no error.
   const std::string& Message() const { return msg_; }
 
   /// Does this error indicate OK status?
@@ -153,6 +152,12 @@ class InferenceServerClient {
   InferStat infer_stat_;
 };
 
+struct RequestParameter {
+  std::string name;
+  std::string value;
+  std::string type;
+};
+
 //==============================================================================
 /// Structure to hold options for Inference Request.
 ///
@@ -161,7 +166,7 @@ struct InferOptions {
       : model_name_(model_name), model_version_(""), request_id_(""),
         sequence_id_(0), sequence_id_str_(""), sequence_start_(false),
         sequence_end_(false), priority_(0), server_timeout_(0),
-        client_timeout_(0)
+        client_timeout_(0), triton_enable_empty_final_response_(false)
   {
   }
   /// The name of the model to run inference.
@@ -209,14 +214,20 @@ struct InferOptions {
   /// https://github.com/triton-inference-server/server/blob/main/docs/user_guide/model_configuration.md#dynamic-batcher
   uint64_t server_timeout_;
   // The maximum end-to-end time, in microseconds, the request is allowed
-  // to take. Note the HTTP library only offer the precision upto
-  // milliseconds. The client will abort request when the specified time
-  // elapses. The request will return error with message "Deadline Exceeded".
+  // to take. The client will abort request when the specified time elapses.
+  // The request will return error with message "Deadline Exceeded".
   // The default value is 0 which means client will wait for the
   // response from the server. This option is not supported for streaming
   // requests. Instead see 'stream_timeout' argument in
   // InferenceServerGrpcClient::StartStream().
+  // NOTE: the HTTP client library only offers millisecond precision, so a
+  // timeout < 1000 microseconds will be rounded down to 0 milliseconds and have
+  // no effect.
   uint64_t client_timeout_;
+  /// Whether to tell Triton to enable an empty final response.
+  bool triton_enable_empty_final_response_;
+  /// Additional parameters to pass to the model
+  std::unordered_map<std::string, RequestParameter> request_parameters;
 };
 
 //==============================================================================
@@ -323,15 +334,31 @@ class InferInput {
   /// \return Error object indicating success or failure.
   Error AppendFromString(const std::vector<std::string>& input);
 
+  /// Get access to the buffer holding raw input. Note the buffer is owned by
+  /// InferInput instance. Users can copy out the data if required to extend
+  /// the lifetime.
+  /// \param buf Returns the pointer to the start of the buffer.
+  /// \param byte_size Returns the size of buffer in bytes.
+  /// \return Error object indicating success or failure of the
+  /// request.
+  Error RawData(const uint8_t** buf, size_t* byte_size);
+
   /// Gets the size of data added into this input in bytes.
   /// \param byte_size The size of data added in bytes.
   /// \return Error object indicating success or failure.
   Error ByteSize(size_t* byte_size) const;
 
+  /// \return true if this input should be sent in binary format.
+  bool BinaryData() const { return binary_data_; }
+
+  /// \return Error object indicating success or failure.
+  Error SetBinaryData(const bool binary_data);
+
  private:
 #ifdef TRITON_INFERENCE_SERVER_CLIENT_CLASS
   friend class TRITON_INFERENCE_SERVER_CLIENT_CLASS;
 #endif
+  friend class HttpInferRequest;
   InferInput(
       const std::string& name, const std::vector<int64_t>& dims,
       const std::string& datatype);
@@ -362,6 +389,8 @@ class InferInput {
   IOType io_type_;
   std::string shm_name_;
   size_t shm_offset_;
+
+  bool binary_data_{true};
 };
 
 //==============================================================================
@@ -380,7 +409,7 @@ class InferRequestedOutput {
   /// \return Error object indicating success or failure.
   static Error Create(
       InferRequestedOutput** infer_output, const std::string& name,
-      const size_t class_count = 0);
+      const size_t class_count = 0, const std::string& datatype = "");
 
   /// Gets name of the associated output tensor.
   /// \return The name of the tensor.
@@ -423,15 +452,23 @@ class InferRequestedOutput {
   Error SharedMemoryInfo(
       std::string* name, size_t* byte_size, size_t* offset) const;
 
+  /// \return true if this output should be received in binary format.
+  bool BinaryData() const { return binary_data_; }
+
+  /// \return Error object indicating success or failure.
+  Error SetBinaryData(const bool binary_data);
+
  private:
 #ifdef TRITON_INFERENCE_SERVER_CLIENT_CLASS
   friend class TRITON_INFERENCE_SERVER_CLIENT_CLASS;
 #endif
 
   explicit InferRequestedOutput(
-      const std::string& name, const size_t class_count = 0);
+      const std::string& name, const std::string& datatype,
+      const size_t class_count = 0);
 
   std::string name_;
+  std::string datatype_;
   size_t class_count_;
 
   // Used only if working with Shared Memory
@@ -440,6 +477,8 @@ class InferRequestedOutput {
   std::string shm_name_;
   size_t shm_byte_size_;
   size_t shm_offset_;
+
+  bool binary_data_{true};
 };
 
 //==============================================================================
@@ -466,14 +505,14 @@ class InferResult {
   virtual Error Id(std::string* id) const = 0;
 
   /// Get the shape of output result returned in the response.
-  /// \param output_name The name of the ouput to get shape.
+  /// \param output_name The name of the output to get shape.
   /// \param shape Returns the shape of result for specified output name.
   /// \return Error object indicating success or failure.
   virtual Error Shape(
       const std::string& output_name, std::vector<int64_t>* shape) const = 0;
 
   /// Get the datatype of output result returned in the response.
-  /// \param output_name The name of the ouput to get datatype.
+  /// \param output_name The name of the output to get datatype.
   /// \param shape Returns the datatype of result for specified output name.
   /// \return Error object indicating success or failure.
   virtual Error Datatype(
@@ -491,6 +530,14 @@ class InferResult {
   virtual Error RawData(
       const std::string& output_name, const uint8_t** buf,
       size_t* byte_size) const = 0;
+
+  /// Get final response bool for this response.
+  /// \return Error object indicating the success or failure.
+  virtual Error IsFinalResponse(bool* is_final_response) const = 0;
+
+  /// Get null response bool for this response.
+  /// \return Error object indicating the success or failure.
+  virtual Error IsNullResponse(bool* is_null_response) const = 0;
 
   /// Get the result data as a vector of strings. The vector will
   /// receive a copy of result data. An error will be generated if

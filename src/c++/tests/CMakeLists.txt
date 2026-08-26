@@ -1,4 +1,4 @@
-# Copyright 2020-2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright 2020-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -24,7 +24,7 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-cmake_minimum_required (VERSION 3.18)
+cmake_minimum_required (VERSION 3.31.8)
 
 if(WIN32)
   message("C++ tests are not currently supported on Windows because "
@@ -86,6 +86,28 @@ target_link_libraries(
 )
 install(
   TARGETS cc_client_test
+  RUNTIME DESTINATION bin
+)
+
+#
+# grpc_cancellation_test
+#
+add_executable(
+  grpc_cancellation_test
+  grpc_cancellation_test.cc
+)
+target_include_directories(
+  grpc_cancellation_test PRIVATE ${GTEST_INCLUDE_DIRS}
+)
+target_link_libraries(
+  grpc_cancellation_test
+  PRIVATE
+    grpcclient_static
+    gtest
+    ${GTEST_LIBRARY}
+)
+install(
+  TARGETS grpc_cancellation_test
   RUNTIME DESTINATION bin
 )
 

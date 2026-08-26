@@ -1,4 +1,4 @@
-// Copyright 2020-2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// Copyright 2020-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -25,10 +25,9 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #pragma once
 
-/// \file
-
 #include <map>
 #include <memory>
+
 #include "common.h"
 #include "ipc.h"
 
@@ -48,7 +47,7 @@ struct HttpSslOptions {
   enum KEYTYPE {
     KEY_PEM = 0,
     KEY_DER = 1
-    // TODO: Support loading private key from crypto engine
+    // TODO TMA-1645: Support loading private key from crypto engine
     // KEY_ENG = 2
   };
   explicit HttpSslOptions()
@@ -477,7 +476,7 @@ class InferenceServerHttpClient : public InferenceServerClient {
   /// Run asynchronous inference on server.
   /// Once the request is completed, the InferResult pointer will be passed to
   /// the provided 'callback' function. Upon the invocation of callback
-  /// function, the ownership of InferResult object is transfered to the
+  /// function, the ownership of InferResult object is transferred to the
   /// function caller. It is then the caller's choice on either retrieving the
   /// results inside the callback function or deferring it to a different thread
   /// so that the client is unblocked. In order to prevent memory leak, user
@@ -559,7 +558,7 @@ class InferenceServerHttpClient : public InferenceServerClient {
   /// Once all the requests are completed, the vector of InferResult pointers
   /// will be passed to the provided 'callback' function. Upon the invocation
   /// of callback function, the ownership of the InferResult objects are
-  /// transfered to the function caller. It is then the caller's choice on
+  /// transferred to the function caller. It is then the caller's choice on
   /// either retrieving the results inside the callback function or deferring it
   /// to a different thread so that the client is unblocked. In order to
   /// prevent memory leak, user must ensure these objects get deleted.
@@ -646,9 +645,9 @@ class InferenceServerHttpClient : public InferenceServerClient {
   void* easy_handle_;
   // curl multi handle for processing asynchronous requests
   void* multi_handle_;
-  // map to record ongoing asynchronous requests with pointer to easy handle
+  // map to record new asynchronous requests with pointer to easy handle
   // or tag id as key
-  AsyncReqMap ongoing_async_requests_;
+  AsyncReqMap new_async_requests_;
 };
 
 }}  // namespace triton::client

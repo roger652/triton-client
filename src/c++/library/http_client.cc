@@ -1,4 +1,4 @@
-// Copyright 2020-2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// Copyright 2020-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -26,20 +26,25 @@
 
 // Include this first to make sure we are a friend of common classes.
 #define TRITON_INFERENCE_SERVER_CLIENT_CLASS InferenceServerHttpClient
-#include "common.h"
+#include "http_client.h"
 
 #include <curl/curl.h>
-#include <zlib.h>
+
 #include <atomic>
 #include <climits>
 #include <cstdint>
 #include <deque>
 #include <iostream>
-#include "http_client.h"
+#include <string>
+#include <utility>
 
-extern "C" {
+#include "common.h"
+
+#ifdef TRITON_ENABLE_ZLIB
+#include <zlib.h>
+#endif
+
 #include "cencode.h"
-}
 
 #define TRITONJSON_STATUSTYPE triton::client::Error
 #define TRITONJSON_STATUSRETURN(M) return triton::client::Error(M)
@@ -125,14 +130,17 @@ Base64Encode(
     int* encoded_size)
 {
   // Encode the handle object to base64
-  base64_encodestate es;
+  libb64::base64_encodestate es;
   base64_init_encodestate(&es);
   *encoded_ptr = (char*)malloc(raw_size * 2); /* ~4/3 x raw_size */
-  *encoded_size = base64_encode_block(raw_ptr, raw_size, *encoded_ptr, &es);
-  int padding_size = base64_encode_blockend(*encoded_ptr + *encoded_size, &es);
+  *encoded_size =
+      libb64::base64_encode_block(raw_ptr, raw_size, *encoded_ptr, &es);
+  int padding_size =
+      libb64::base64_encode_blockend(*encoded_ptr + *encoded_size, &es);
   *encoded_size += padding_size;
 }
 
+#ifdef TRITON_ENABLE_ZLIB
 // libcurl provides automatic decompression, so only implement compression
 Error
 CompressData(
@@ -211,6 +219,17 @@ CompressData(
   }
   return Error::Success;
 }
+#else
+Error
+CompressData(
+    const InferenceServerHttpClient::CompressionType type,
+    const std::deque<std::pair<uint8_t*, size_t>>& source,
+    const size_t source_byte_size,
+    std::vector<std::pair<std::unique_ptr<char[]>, size_t>>* compressed_data)
+{
+  return Error("Cannot compress data as ZLIB is not included in this build");
+}
+#endif
 
 Error
 ParseSslCertType(
@@ -313,6 +332,15 @@ class HttpInferRequest : public InferRequest {
       const std::vector<const InferRequestedOutput*>& outputs,
       triton::common::TritonJson::Value* request_json);
 
+ protected:
+  virtual Error ConvertBinaryInputsToJSON(
+      InferInput& input, triton::common::TritonJson::Value& data_json) const;
+
+  virtual Error ConvertBinaryInputToJSON(
+      const uint8_t* buf, const size_t buf_size, const std::string& datatype,
+      triton::common::TritonJson::Value& data_json) const;
+
+ private:
   // Pointer to the list of the HTTP request header, keep it such that it will
   // be valid during the transfer and can be freed once transfer is completed.
   struct curl_slist* header_list_;
@@ -421,6 +449,23 @@ HttpInferRequest::PrepareRequestJson(
       if (outputs.empty()) {
         parameters_json.AddBool("binary_data_output", true);
       }
+
+      for (auto& param : options.request_parameters) {
+        if (param.second.type == "string") {
+          parameters_json.AddString(
+              param.first.c_str(), param.second.value.c_str(),
+              param.second.value.size());
+        } else if (param.second.type == "int") {
+          parameters_json.AddInt(
+              param.first.c_str(), std::stoi(param.second.value));
+        } else if (param.second.type == "bool") {
+          bool val = false;
+          if (param.second.value == "true") {
+            val = true;
+          }
+          parameters_json.AddBool(param.first.c_str(), val);
+        }
+      }
     }
 
     request_json->Add("parameters", std::move(parameters_json));
@@ -460,7 +505,8 @@ HttpInferRequest::PrepareRequestJson(
         if (offset != 0) {
           ioparams_json.AddUInt("shared_memory_offset", offset);
         }
-      } else {
+        io_json.Add("parameters", std::move(ioparams_json));
+      } else if (io->BinaryData()) {
         size_t byte_size;
         Error err = io->ByteSize(&byte_size);
         if (!err.IsOk()) {
@@ -468,9 +514,19 @@ HttpInferRequest::PrepareRequestJson(
         }
 
         ioparams_json.AddUInt("binary_data_size", byte_size);
+        io_json.Add("parameters", std::move(ioparams_json));
+      } else {
+        triton::common::TritonJson::Value data_json(
+            *request_json, triton::common::TritonJson::ValueType::ARRAY);
+
+        Error err = ConvertBinaryInputsToJSON(*io, data_json);
+        if (!err.IsOk()) {
+          return err;
+        }
+
+        io_json.Add("data", std::move(data_json));
       }
 
-      io_json.Add("parameters", std::move(ioparams_json));
       inputs_json.Append(std::move(io_json));
     }
 
@@ -508,7 +564,7 @@ HttpInferRequest::PrepareRequestJson(
           ioparams_json.AddUInt("shared_memory_offset", offset);
         }
       } else {
-        ioparams_json.AddBool("binary_data", true);
+        ioparams_json.AddBool("binary_data", io->BinaryData());
       }
 
       io_json.Add("parameters", std::move(ioparams_json));
@@ -516,6 +572,106 @@ HttpInferRequest::PrepareRequestJson(
     }
 
     request_json->Add("outputs", std::move(outputs_json));
+  }
+
+  return Error::Success;
+}
+
+Error
+HttpInferRequest::ConvertBinaryInputsToJSON(
+    InferInput& input, triton::common::TritonJson::Value& data_json) const
+{
+  input.PrepareForRequest();
+  bool end_of_input{false};
+  while (!end_of_input) {
+    const uint8_t* buf{nullptr};
+    size_t buf_size{0};
+    input.GetNext(&buf, &buf_size, &end_of_input);
+    size_t element_count{1};
+    for (size_t i = 1; i < input.Shape().size(); i++) {
+      element_count *= input.Shape()[i];
+    }
+    if (buf != nullptr) {
+      Error err = ConvertBinaryInputToJSON(
+          buf, element_count, input.Datatype(), data_json);
+      if (!err.IsOk()) {
+        return err;
+      }
+    }
+  }
+
+  return Error::Success;
+}
+
+Error
+HttpInferRequest::ConvertBinaryInputToJSON(
+    const uint8_t* buf, const size_t element_count, const std::string& datatype,
+    triton::common::TritonJson::Value& data_json) const
+{
+  if (datatype == "BOOL") {
+    for (size_t i = 0; i < element_count; i++) {
+      data_json.AppendBool(reinterpret_cast<const bool*>(buf)[i]);
+    }
+  } else if (datatype == "UINT8") {
+    for (size_t i = 0; i < element_count; i++) {
+      data_json.AppendUInt(reinterpret_cast<const uint8_t*>(buf)[i]);
+    }
+  } else if (datatype == "UINT16") {
+    for (size_t i = 0; i < element_count; i++) {
+      data_json.AppendUInt(reinterpret_cast<const uint16_t*>(buf)[i]);
+    }
+  } else if (datatype == "UINT32") {
+    for (size_t i = 0; i < element_count; i++) {
+      data_json.AppendUInt(reinterpret_cast<const uint32_t*>(buf)[i]);
+    }
+  } else if (datatype == "UINT64") {
+    for (size_t i = 0; i < element_count; i++) {
+      data_json.AppendUInt(reinterpret_cast<const uint64_t*>(buf)[i]);
+    }
+  } else if (datatype == "INT8") {
+    for (size_t i = 0; i < element_count; i++) {
+      data_json.AppendInt(reinterpret_cast<const int8_t*>(buf)[i]);
+    }
+  } else if (datatype == "INT16") {
+    for (size_t i = 0; i < element_count; i++) {
+      data_json.AppendInt(reinterpret_cast<const int16_t*>(buf)[i]);
+    }
+  } else if (datatype == "INT32") {
+    for (size_t i = 0; i < element_count; i++) {
+      data_json.AppendInt(reinterpret_cast<const int32_t*>(buf)[i]);
+    }
+  } else if (datatype == "INT64") {
+    for (size_t i = 0; i < element_count; i++) {
+      data_json.AppendInt(reinterpret_cast<const int64_t*>(buf)[i]);
+    }
+  } else if (datatype == "FP16") {
+    return Error(
+        "datatype '" + datatype +
+        "' is not supported with JSON. Please use the binary data format");
+
+  } else if (datatype == "FP32") {
+    for (size_t i = 0; i < element_count; i++) {
+      data_json.AppendDouble(reinterpret_cast<const float*>(buf)[i]);
+    }
+  } else if (datatype == "FP64") {
+    for (size_t i = 0; i < element_count; i++) {
+      data_json.AppendDouble(reinterpret_cast<const double*>(buf)[i]);
+    }
+  } else if (datatype == "BYTES") {
+    size_t offset{0};
+    for (size_t i = 0; i < element_count; i++) {
+      const size_t len{*reinterpret_cast<const uint32_t*>(buf + offset)};
+      data_json.AppendStringRef(
+          reinterpret_cast<const char*>(buf + offset + sizeof(const uint32_t)),
+          len);
+      offset += sizeof(const uint32_t) + len;
+    }
+  } else if (datatype == "BF16") {
+    return Error(
+        "datatype '" + datatype +
+        "' is not supported with JSON. Please use the binary data format");
+  } else {
+    return Error("datatype '" + datatype + "' is invalid");
   }
 
   return Error::Success;
@@ -546,9 +702,9 @@ HttpInferRequest::GetNextInput(uint8_t* buf, size_t size, size_t* input_bytes)
 
       data_buffers_.front().first += csz;
       data_buffers_.front().second -= csz;
-      if (data_buffers_.front().second == 0) {
-        data_buffers_.pop_front();
-      }
+    }
+    if (data_buffers_.front().second == 0) {
+      data_buffers_.pop_front();
     }
   }
 
@@ -600,6 +756,8 @@ class InferResultHttp : public InferResult {
   Error RawData(
       const std::string& output_name, const uint8_t** buf,
       size_t* byte_size) const override;
+  Error IsFinalResponse(bool* is_final_response) const override;
+  Error IsNullResponse(bool* is_null_response) const override;
   Error StringData(
       const std::string& output_name,
       std::vector<std::string>* string_result) const override;
@@ -609,6 +767,15 @@ class InferResultHttp : public InferResult {
   InferResultHttp(std::shared_ptr<HttpInferRequest> infer_request);
   InferResultHttp(const Error err) : status_(err) {}
 
+ protected:
+  InferResultHttp() {}
+  ~InferResultHttp();
+
+  virtual Error ConvertJSONOutputToBinary(
+      triton::common::TritonJson::Value& data_json, const std::string& datatype,
+      const uint8_t** buf, size_t* buf_size) const;
+
+ private:
   std::map<std::string, triton::common::TritonJson::Value>
       output_name_to_result_map_;
   std::map<std::string, std::pair<const uint8_t*, const size_t>>
@@ -617,6 +784,10 @@ class InferResultHttp : public InferResult {
   Error status_;
   triton::common::TritonJson::Value response_json_;
   std::shared_ptr<HttpInferRequest> infer_request_;
+
+  bool binary_data_{true};
+  bool is_final_response_{true};
+  bool is_null_response_{false};
 };
 
 void
@@ -790,6 +961,26 @@ InferResultHttp::RawData(
 }
 
 Error
+InferResultHttp::IsFinalResponse(bool* is_final_response) const
+{
+  if (is_final_response == nullptr) {
+    return Error("is_final_response cannot be nullptr");
+  }
+  *is_final_response = is_final_response_;
+  return Error::Success;
+}
+
+Error
+InferResultHttp::IsNullResponse(bool* is_null_response) const
+{
+  if (is_null_response == nullptr) {
+    return Error("is_null_response cannot be nullptr");
+  }
+  *is_null_response = is_null_response_;
+  return Error::Success;
+}
+
+Error
 InferResultHttp::StringData(
     const std::string& output_name,
     std::vector<std::string>* string_result) const
@@ -905,7 +1096,7 @@ InferResultHttp::InferResultHttp(
 
           std::string output_name(name_str, name_strlen);
 
-          triton::common::TritonJson::Value param_json;
+          triton::common::TritonJson::Value param_json, data_json;
           if (output_json.Find("parameters", &param_json)) {
             uint64_t data_size = 0;
             status_ = param_json.MemberAsUInt("binary_data_size", &data_size);
@@ -921,6 +1112,25 @@ InferResultHttp::InferResultHttp(
                         offset,
                     data_size));
             offset += data_size;
+          } else if (output_json.Find("data", &data_json)) {
+            binary_data_ = false;
+            std::string datatype;
+            status_ = output_json.MemberAsString("datatype", &datatype);
+            if (!status_.IsOk()) {
+              break;
+            }
+
+            const uint8_t* buf{nullptr};
+            size_t buf_size{0};
+            status_ =
+                ConvertJSONOutputToBinary(data_json, datatype, &buf, &buf_size);
+            if (!status_.IsOk()) {
+              break;
+            }
+
+            output_name_to_buffer_map_.emplace(
+                output_name,
+                std::pair<const uint8_t*, const size_t>(buf, buf_size));
           }
 
           output_name_to_result_map_[output_name] = std::move(output_json);
@@ -928,6 +1138,146 @@ InferResultHttp::InferResultHttp(
       }
     }
   }
+}
+
+InferResultHttp::~InferResultHttp()
+{
+  if (binary_data_) {
+    return;
+  }
+
+  for (auto& buf_pair : output_name_to_buffer_map_) {
+    const uint8_t* buf{buf_pair.second.first};
+    delete buf;
+  }
+}
+
+Error
+InferResultHttp::ConvertJSONOutputToBinary(
+    triton::common::TritonJson::Value& data_json, const std::string& datatype,
+    const uint8_t** buf, size_t* buf_size) const
+{
+  const size_t element_count{data_json.ArraySize()};
+
+  if (datatype == "BOOL") {
+    *buf = reinterpret_cast<const uint8_t*>(new bool[element_count]);
+    *buf_size = sizeof(bool) * element_count;
+    for (size_t i = 0; i < element_count; i++) {
+      bool value{false};
+      data_json.IndexAsBool(i, &value);
+      const_cast<bool*>(reinterpret_cast<const bool*>(*buf))[i] = value;
+    }
+  } else if (datatype == "UINT8") {
+    *buf = reinterpret_cast<const uint8_t*>(new uint8_t[element_count]);
+    *buf_size = sizeof(uint8_t) * element_count;
+    for (size_t i = 0; i < element_count; i++) {
+      uint64_t value{0};
+      data_json.IndexAsUInt(i, &value);
+      const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(*buf))[i] = value;
+    }
+  } else if (datatype == "UINT16") {
+    *buf = reinterpret_cast<const uint8_t*>(new uint16_t[element_count]);
+    *buf_size = sizeof(uint16_t) * element_count;
+    for (size_t i = 0; i < element_count; i++) {
+      uint64_t value{0};
+      data_json.IndexAsUInt(i, &value);
+      const_cast<uint16_t*>(reinterpret_cast<const uint16_t*>(*buf))[i] = value;
+    }
+  } else if (datatype == "UINT32") {
+    *buf = reinterpret_cast<const uint8_t*>(new uint32_t[element_count]);
+    *buf_size = sizeof(uint32_t) * element_count;
+    for (size_t i = 0; i < element_count; i++) {
+      uint64_t value{0};
+      data_json.IndexAsUInt(i, &value);
+      const_cast<uint32_t*>(reinterpret_cast<const uint32_t*>(*buf))[i] = value;
+    }
+  } else if (datatype == "UINT64") {
+    *buf = reinterpret_cast<const uint8_t*>(new uint64_t[element_count]);
+    *buf_size = sizeof(uint64_t) * element_count;
+    for (size_t i = 0; i < element_count; i++) {
+      uint64_t value{0};
+      data_json.IndexAsUInt(i, &value);
+      const_cast<uint64_t*>(reinterpret_cast<const uint64_t*>(*buf))[i] = value;
+    }
+  } else if (datatype == "INT8") {
+    *buf = reinterpret_cast<const uint8_t*>(new int8_t[element_count]);
+    *buf_size = sizeof(int8_t) * element_count;
+    for (size_t i = 0; i < element_count; i++) {
+      int64_t value{0};
+      data_json.IndexAsInt(i, &value);
+      const_cast<int8_t*>(reinterpret_cast<const int8_t*>(*buf))[i] = value;
+    }
+  } else if (datatype == "INT16") {
+    *buf = reinterpret_cast<const uint8_t*>(new int16_t[element_count]);
+    *buf_size = sizeof(int16_t) * element_count;
+    for (size_t i = 0; i < element_count; i++) {
+      int64_t value{0};
+      data_json.IndexAsInt(i, &value);
+      const_cast<int16_t*>(reinterpret_cast<const int16_t*>(*buf))[i] = value;
+    }
+  } else if (datatype == "INT32") {
+    *buf = reinterpret_cast<const uint8_t*>(new int32_t[element_count]);
+    *buf_size = sizeof(int32_t) * element_count;
+    for (size_t i = 0; i < element_count; i++) {
+      int64_t value{0};
+      data_json.IndexAsInt(i, &value);
+      const_cast<int32_t*>(reinterpret_cast<const int32_t*>(*buf))[i] = value;
+    }
+  } else if (datatype == "INT64") {
+    *buf = reinterpret_cast<const uint8_t*>(new int64_t[element_count]);
+    *buf_size = sizeof(int64_t) * element_count;
+    for (size_t i = 0; i < element_count; i++) {
+      int64_t value{0};
+      data_json.IndexAsInt(i, &value);
+      const_cast<int64_t*>(reinterpret_cast<const int64_t*>(*buf))[i] = value;
+    }
+  } else if (datatype == "FP16") {
+    return Error("datatype '" + datatype + "' is not supported with JSON.");
+  } else if (datatype == "FP32") {
+    *buf = reinterpret_cast<const uint8_t*>(new float[element_count]);
+    *buf_size = sizeof(float) * element_count;
+    for (size_t i = 0; i < element_count; i++) {
+      double value{0.0};
+      data_json.IndexAsDouble(i, &value);
+      const_cast<float*>(reinterpret_cast<const float*>(*buf))[i] = value;
+    }
+  } else if (datatype == "FP64") {
+    *buf = reinterpret_cast<const uint8_t*>(new float[element_count]);
+    *buf_size = sizeof(double) * element_count;
+    for (size_t i = 0; i < element_count; i++) {
+      double value{0.0};
+      data_json.IndexAsDouble(i, &value);
+      const_cast<double*>(reinterpret_cast<const double*>(*buf))[i] = value;
+    }
+  } else if (datatype == "BYTES") {
+    size_t total_buf_size{0};
+    std::vector<std::pair<const char*, size_t>> bytes_pairs{};
+    bytes_pairs.resize(element_count);
+    for (size_t i = 0; i < element_count; i++) {
+      data_json.IndexAsString(i, &bytes_pairs[i].first, &bytes_pairs[i].second);
+      total_buf_size += sizeof(const uint32_t) + bytes_pairs[i].second;
+    }
+    *buf = reinterpret_cast<const uint8_t*>(new uint8_t[total_buf_size]);
+    *buf_size = total_buf_size;
+    size_t offset{0};
+    for (const auto& bytes_pair : bytes_pairs) {
+      const char* bytes{bytes_pair.first};
+      size_t bytes_size{bytes_pair.second};
+      std::memcpy(
+          const_cast<uint8_t*>(*buf + offset), &bytes_size,
+          sizeof(const uint32_t));
+      std::memcpy(
+          const_cast<uint8_t*>(*buf + offset + sizeof(const uint32_t)), bytes,
+          bytes_size);
+      offset += sizeof(const uint32_t) + bytes_size;
+    }
+  } else if (datatype == "BF16") {
+    return Error("datatype '" + datatype + "' is not supported with JSON.");
+  } else {
+    return Error("datatype '" + datatype + "' is invalid");
+  }
+
+  return Error::Success;
 }
 
 //==============================================================================
@@ -1031,27 +1381,23 @@ InferenceServerHttpClient::InferenceServerHttpClient(
 
 InferenceServerHttpClient::~InferenceServerHttpClient()
 {
-  exiting_ = true;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    exiting_ = true;
+  }
+
+  curl_multi_wakeup(multi_handle_);
 
   // thread not joinable if AsyncInfer() is not called
   // (it is default constructed thread before the first AsyncInfer() call)
   if (worker_.joinable()) {
-    cv_.notify_all();
     worker_.join();
   }
 
   if (easy_handle_ != nullptr) {
     curl_easy_cleanup(reinterpret_cast<CURL*>(easy_handle_));
   }
-
-  if (multi_handle_ != nullptr) {
-    for (auto& request : ongoing_async_requests_) {
-      CURL* easy_handle = reinterpret_cast<CURL*>(request.first);
-      curl_multi_remove_handle(multi_handle_, easy_handle);
-      curl_easy_cleanup(easy_handle);
-    }
-    curl_multi_cleanup(multi_handle_);
-  }
+  curl_multi_cleanup(multi_handle_);
 }
 
 Error
@@ -1476,10 +1822,13 @@ InferenceServerHttpClient::Infer(
   // RECV_END will be set.
   auto curl_status = curl_easy_perform(easy_handle_);
   if (curl_status == CURLE_OPERATION_TIMEDOUT) {
-    sync_request->http_code_ = 499;
+    return Error(
+        "HTTP client failed (Deadline Exceeded): " +
+        std::string(curl_easy_strerror(curl_status)));
   } else if (curl_status != CURLE_OK) {
-    sync_request->http_code_ = 400;
-  } else {
+    return Error(
+        "HTTP client failed: " + std::string(curl_easy_strerror(curl_status)));
+  } else {  // Success
     curl_easy_getinfo(
         easy_handle_, CURLINFO_RESPONSE_CODE, &sync_request->http_code_);
   }
@@ -1497,7 +1846,6 @@ InferenceServerHttpClient::Infer(
 
   return err;
 }
-
 
 Error
 InferenceServerHttpClient::AsyncInfer(
@@ -1545,25 +1893,28 @@ InferenceServerHttpClient::AsyncInfer(
   {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    auto insert_result = ongoing_async_requests_.emplace(std::make_pair(
+    if (exiting_) {
+      return Error("Client is exiting.");
+    }
+
+    auto insert_result = new_async_requests_.emplace(std::make_pair(
         reinterpret_cast<uintptr_t>(multi_easy_handle), async_request));
     if (!insert_result.second) {
       curl_easy_cleanup(multi_easy_handle);
       return Error("Failed to insert new asynchronous request context.");
     }
-
-    async_request->Timer().CaptureTimestamp(RequestTimers::Kind::SEND_START);
-    if (async_request->total_input_byte_size_ == 0) {
-      // Set SEND_END here because CURLOPT_READFUNCTION will not be called if
-      // content length is 0. In that case, we can't measure SEND_END properly
-      // (send ends after sending request header).
-      async_request->Timer().CaptureTimestamp(RequestTimers::Kind::SEND_END);
-    }
-
-    curl_multi_add_handle(multi_handle_, multi_easy_handle);
   }
 
-  cv_.notify_all();
+  async_request->Timer().CaptureTimestamp(RequestTimers::Kind::SEND_START);
+  curl_multi_wakeup(multi_handle_);
+
+  if (async_request->total_input_byte_size_ == 0) {
+    // Set SEND_END here because CURLOPT_READFUNCTION will not be called if
+    // content length is 0. In that case, we can't measure SEND_END properly
+    // (send ends after sending request header).
+    async_request->Timer().CaptureTimestamp(RequestTimers::Kind::SEND_END);
+  }
+
   return Error::Success;
 }
 
@@ -1773,8 +2124,13 @@ InferenceServerHttpClient::PreRunProcessing(
   }
 
   // Add the buffers holding input tensor data
+  bool all_inputs_are_json{true};
   for (const auto this_input : inputs) {
-    if (!this_input->IsSharedMemory()) {
+    if (this_input->BinaryData()) {
+      all_inputs_are_json = false;
+    }
+
+    if (!this_input->IsSharedMemory() && this_input->BinaryData()) {
       this_input->PrepareForRequest();
       bool end_of_input = false;
       while (!end_of_input) {
@@ -1794,8 +2150,14 @@ InferenceServerHttpClient::PreRunProcessing(
       break;
     case CompressionType::DEFLATE:
     case CompressionType::GZIP:
+#ifdef TRITON_ENABLE_ZLIB
       http_request->CompressInput(request_compression_algorithm);
       break;
+#else
+      return Error(
+          "Compression type needs to be CompressionType::NONE since ZLIB is "
+          "not included in client build");
+#endif
   }
 
   // Prepare curl
@@ -1848,12 +2210,17 @@ InferenceServerHttpClient::PreRunProcessing(
 
   struct curl_slist* list = nullptr;
 
-  std::string infer_hdr{std::string(kInferHeaderContentLengthHTTPHeader) +
-                        ": " +
-                        std::to_string(http_request->request_json_.Size())};
+  std::string infer_hdr{
+      std::string(kInferHeaderContentLengthHTTPHeader) + ": " +
+      std::to_string(http_request->request_json_.Size())};
   list = curl_slist_append(list, infer_hdr.c_str());
   list = curl_slist_append(list, "Expect:");
-  list = curl_slist_append(list, "Content-Type: application/octet-stream");
+  if (all_inputs_are_json) {
+    list = curl_slist_append(list, "Content-Type: application/json");
+  } else {
+    list = curl_slist_append(list, "Content-Type: application/octet-stream");
+  }
+
   for (const auto& pr : headers) {
     std::string hdr = pr.first + ": " + pr.second;
     list = curl_slist_append(list, hdr.c_str());
@@ -1896,88 +2263,103 @@ InferenceServerHttpClient::PreRunProcessing(
 void
 InferenceServerHttpClient::AsyncTransfer()
 {
-  int place_holder = 0;
+  int messages_in_queue = 0;
+  int still_running = 0;
+  int numfds = 0;
   CURLMsg* msg = nullptr;
+  AsyncReqMap ongoing_async_requests;
   do {
-    std::vector<std::shared_ptr<HttpInferRequest>> request_list;
+    // Check for new requests and add them to ongoing requests
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
 
-    // sleep if no work is available
-    std::unique_lock<std::mutex> lock(mutex_);
-    cv_.wait(lock, [this] {
-      if (this->exiting_) {
-        return true;
+      for (auto& pair : new_async_requests_) {
+        curl_multi_add_handle(
+            multi_handle_, reinterpret_cast<CURL*>(pair.first));
+
+        ongoing_async_requests[pair.first] = std::move(pair.second);
       }
-      // wake up if an async request has been generated
-      return !this->ongoing_async_requests_.empty();
-    });
+      new_async_requests_.clear();
+    }
 
-    CURLMcode mc = curl_multi_perform(multi_handle_, &place_holder);
-    int numfds;
-    if (mc == CURLM_OK) {
-      // Wait for activity. If there are no descripters in the multi_handle_
-      // then curl_multi_wait will return immediately
-      mc = curl_multi_wait(multi_handle_, NULL, 0, INT_MAX, &numfds);
-      if (mc == CURLM_OK) {
-        while ((msg = curl_multi_info_read(multi_handle_, &place_holder))) {
-          uintptr_t identifier = reinterpret_cast<uintptr_t>(msg->easy_handle);
-          auto itr = ongoing_async_requests_.find(identifier);
-          // This shouldn't happen
-          if (itr == ongoing_async_requests_.end()) {
-            std::cerr
-                << "Unexpected error: received completed request that is not "
-                   "in the list of asynchronous requests"
-                << std::endl;
-            curl_multi_remove_handle(multi_handle_, msg->easy_handle);
-            curl_easy_cleanup(msg->easy_handle);
-            continue;
-          }
+    CURLMcode mc = curl_multi_perform(multi_handle_, &still_running);
 
-          long http_code = 400;
-          if (msg->data.result == CURLE_OK) {
-            curl_easy_getinfo(
-                msg->easy_handle, CURLINFO_RESPONSE_CODE, &http_code);
-          } else if (msg->data.result == CURLE_OPERATION_TIMEDOUT) {
-            http_code = 499;
-          }
-
-          request_list.emplace_back(itr->second);
-          ongoing_async_requests_.erase(itr);
-          curl_multi_remove_handle(multi_handle_, msg->easy_handle);
-          curl_easy_cleanup(msg->easy_handle);
-
-          std::shared_ptr<HttpInferRequest> async_request = request_list.back();
-          async_request->http_code_ = http_code;
-
-          if (msg->msg != CURLMSG_DONE) {
-            // Something wrong happened.
-            std::cerr << "Unexpected error: received CURLMsg=" << msg->msg
-                      << std::endl;
-          } else {
-            async_request->Timer().CaptureTimestamp(
-                RequestTimers::Kind::REQUEST_END);
-            Error err = UpdateInferStat(async_request->Timer());
-            if (!err.IsOk()) {
-              std::cerr << "Failed to update context stat: " << err
-                        << std::endl;
-            }
-          }
-        }
-      } else {
-        std::cerr << "Unexpected error: curl_multi failed. Code:" << mc
-                  << std::endl;
-      }
-    } else {
+    if (mc != CURLM_OK) {
       std::cerr << "Unexpected error: curl_multi failed. Code:" << mc
                 << std::endl;
+      continue;
     }
-    lock.unlock();
 
-    for (auto& this_request : request_list) {
+    while ((msg = curl_multi_info_read(multi_handle_, &messages_in_queue))) {
+      if (msg->msg != CURLMSG_DONE) {
+        // Something wrong happened.
+        std::cerr << "Unexpected error: received CURLMsg=" << msg->msg
+                  << std::endl;
+        continue;
+      }
+
+      uintptr_t identifier = reinterpret_cast<uintptr_t>(msg->easy_handle);
+      auto itr = ongoing_async_requests.find(identifier);
+      // This shouldn't happen
+      if (itr == ongoing_async_requests.end()) {
+        std::cerr << "Unexpected error: received completed request that is not "
+                     "in the list of asynchronous requests"
+                  << std::endl;
+        curl_multi_remove_handle(multi_handle_, msg->easy_handle);
+        curl_easy_cleanup(msg->easy_handle);
+        continue;
+      }
+      auto async_request = itr->second;
+
+      uint32_t http_code = 400;
+      if (msg->data.result == CURLE_OK) {
+        curl_easy_getinfo(msg->easy_handle, CURLINFO_RESPONSE_CODE, &http_code);
+        async_request->Timer().CaptureTimestamp(
+            RequestTimers::Kind::REQUEST_END);
+        Error err = UpdateInferStat(async_request->Timer());
+        if (!err.IsOk()) {
+          std::cerr << "Failed to update context stat: " << err << std::endl;
+        }
+      } else if (msg->data.result == CURLE_OPERATION_TIMEDOUT) {
+        http_code = 499;
+      }
+
+      async_request->http_code_ = http_code;
       InferResult* result;
-      InferResultHttp::Create(&result, this_request);
-      this_request->callback_(result);
+      InferResultHttp::Create(&result, async_request);
+      async_request->callback_(result);
+      ongoing_async_requests.erase(itr);
+      curl_multi_remove_handle(multi_handle_, msg->easy_handle);
+      curl_easy_cleanup(msg->easy_handle);
+    }
+
+    // Wait for activity on existing requests or
+    // explicit curl_multi_wakeup call
+    //
+    // If there are no descriptors in the multi_handle_
+    // then curl_multi_poll will wait until curl_multi_wakeup
+    // is called
+    //
+    // curl_multi_wakeup is called when adding a new request
+    // or exiting
+
+    mc = curl_multi_poll(multi_handle_, NULL, 0, INT_MAX, &numfds);
+    if (mc != CURLM_OK) {
+      std::cerr << "Unexpected error: curl_multi_poll failed. Code:" << mc
+                << std::endl;
     }
   } while (!exiting_);
+
+  for (auto& request : ongoing_async_requests) {
+    CURL* easy_handle = reinterpret_cast<CURL*>(request.first);
+    curl_multi_remove_handle(multi_handle_, easy_handle);
+    curl_easy_cleanup(easy_handle);
+  }
+
+  for (auto& request : new_async_requests_) {
+    CURL* easy_handle = reinterpret_cast<CURL*>(request.first);
+    curl_easy_cleanup(easy_handle);
+  }
 }
 
 size_t

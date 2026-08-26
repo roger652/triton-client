@@ -1,4 +1,4 @@
-# Copyright (c) 2020-2021, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2020-2025, NVIDIA CORPORATION. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -24,7 +24,7 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-cmake_minimum_required (VERSION 3.18)
+cmake_minimum_required (VERSION 3.31.8)
 
 add_subdirectory(tritonclient)
 
@@ -93,53 +93,12 @@ add_custom_target(
 #
 # Linux specific Wheel file. Compatible with x86, x64 and aarch64
 #
-if (NOT WIN32)
-  # Can generate linux specific wheel file on linux systems only.
-  set(LINUX_WHEEL_DEPENDS
-        cshm
-        ${WHEEL_DEPENDS}
-  )
-  if(${TRITON_ENABLE_GPU})
-    set(LINUX_WHEEL_DEPENDS
-          ccudashm
-          ${LINUX_WHEEL_DEPENDS}
-    )
-  endif() # TRITON_ENABLE_GPU
-
-  if (${TRITON_ENABLE_PERF_ANALYZER})
-    set(perf_analyzer_arg --perf-analyzer ${CMAKE_INSTALL_PREFIX}/bin/perf_analyzer)
-  endif()
-  set(linux_wheel_stamp_file "linux_stamp.whl")
-  add_custom_command(
-    OUTPUT "${linux_wheel_stamp_file}"
-    COMMAND python3
-    ARGS
-      "${CMAKE_CURRENT_SOURCE_DIR}/build_wheel.py"
-      --dest-dir "${CMAKE_CURRENT_BINARY_DIR}/linux"
-      --linux
-      ${perf_analyzer_arg}
-    DEPENDS ${LINUX_WHEEL_DEPENDS}
-  )
-
-  add_custom_target(
-    linux-client-wheel ALL
-    DEPENDS
-      "${linux_wheel_stamp_file}"
-  )
-endif() # NOT WIN32
 
 if(${TRITON_ENABLE_PYTHON_GRPC})
   add_dependencies(
     generic-client-wheel
     grpc-service-py-library proto-py-library
   )
-
-  if (NOT WIN32)
-    add_dependencies(
-      linux-client-wheel
-      grpc-service-py-library proto-py-library
-  )
-  endif() # NOT WIN32
 
   file(
     GLOB generated-py
@@ -158,9 +117,3 @@ install(
   CODE "file(INSTALL \${_Wheel} DESTINATION \"${CMAKE_INSTALL_PREFIX}/python\")"
 )
 
-if (NOT WIN32)
-  install(
-    CODE "file(GLOB _Wheel \"${CMAKE_CURRENT_BINARY_DIR}/linux/triton*.whl\")"
-    CODE "file(INSTALL \${_Wheel} DESTINATION \"${CMAKE_INSTALL_PREFIX}/python\")"
-  )
-endif() # NOT WIN32

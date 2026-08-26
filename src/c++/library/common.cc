@@ -1,4 +1,4 @@
-// Copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
+// Copyright 2020-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -183,6 +183,20 @@ InferInput::AppendFromString(const std::vector<std::string>& input)
 }
 
 Error
+InferInput::RawData(const uint8_t** buf, size_t* byte_size)
+{
+  if (bufs_.size()) {
+    // TMA-1775 - handle multi-batch case
+    *buf = bufs_[0];
+    *byte_size = buf_byte_sizes_[0];
+  } else {
+    *buf = nullptr;
+    *byte_size = 0;
+  }
+  return Error::Success;
+}
+
+Error
 InferInput::ByteSize(size_t* byte_size) const
 {
   *byte_size = byte_size_;
@@ -208,6 +222,13 @@ InferInput::SharedMemoryInfo(
   *offset = shm_offset_;
   *byte_size = byte_size_;
 
+  return Error::Success;
+}
+
+Error
+InferInput::SetBinaryData(const bool binary_data)
+{
+  binary_data_ = binary_data;
   return Error::Success;
 }
 
@@ -272,9 +293,9 @@ InferInput::GetNext(
 Error
 InferRequestedOutput::Create(
     InferRequestedOutput** infer_output, const std::string& name,
-    const size_t class_count)
+    const size_t class_count, const std::string& datatype)
 {
-  *infer_output = new InferRequestedOutput(name, class_count);
+  *infer_output = new InferRequestedOutput(name, datatype, class_count);
   return Error::Success;
 }
 
@@ -302,8 +323,10 @@ InferRequestedOutput::UnsetSharedMemory()
 }
 
 InferRequestedOutput::InferRequestedOutput(
-    const std::string& name, const size_t class_count)
-    : name_(name), class_count_(class_count), io_type_(NONE)
+    const std::string& name, const std::string& datatype,
+    const size_t class_count)
+    : name_(name), datatype_(datatype), class_count_(class_count),
+      io_type_(NONE)
 {
 }
 
@@ -319,6 +342,13 @@ InferRequestedOutput::SharedMemoryInfo(
   *byte_size = shm_byte_size_;
   *offset = shm_offset_;
 
+  return Error::Success;
+}
+
+Error
+InferRequestedOutput::SetBinaryData(const bool binary_data)
+{
+  binary_data_ = binary_data;
   return Error::Success;
 }
 
